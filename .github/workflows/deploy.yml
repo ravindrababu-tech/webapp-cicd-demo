@@ -11,39 +11,66 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ap-south-1
+  EB_APPLICATION_NAME: sample-web-app
+  EB_ENVIRONMENT_NAME: Sample-web-app-env
+  S3_BUCKET: webapp-cicd-artifacts-909643315895
+  S3_KEY: webapp-cicd-demo/${{ github.sha }}.zip
+
 jobs:
   deploy:
+    name: Build and Deploy
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ap-south-1
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
 
       - name: Package application
-        run: zip -r application.zip application.py requirements.txt Procfile
-
-      - name: Upload application bundle to S3
+        shell: bash
         run: |
-          aws s3 cp application.zip \
-            s3://webapp-cicd-artifacts-909643315895/deployments/${GITHUB_SHA}.zip
+          zip -r application.zip application.py requirements.txt Procfile
+          mv application.zip deployment.zip
+
+      - name: Upload deployment package to S3
+        run: |
+          aws s3 cp deployment.zip \
+            "s3://${S3_BUCKET}/${S3_KEY}"
 
       - name: Create Elastic Beanstalk application version
         run: |
           aws elasticbeanstalk create-application-version \
-            --application-name sample-web-app \
-            --version-label "github-${GITHUB_SHA}" \
-            --source-bundle S3Bucket=webapp-cicd-artifacts-909643315895,S3Key=deployments/${GITHUB_SHA}.zip \
+            --application-name "$EB_APPLICATION_NAME" \
+            --version-label "gh-${GITHUB_SHA}" \
+            --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
             --process
 
-      - name: Deploy application
+      - name: Deploy to Elastic Beanstalk
         run: |
           aws elasticbeanstalk update-environment \
-            --application-name sample-web-app \
-            --environment-name Sample-web-app-env \
-            --version-label "github-${GITHUB_SHA}"
+            --application-name "$EB_APPLICATION_NAME" \
+            --environment-name "$EB_ENVIRONMENT_NAME" \
+            --version-label "gh-${GITHUB_SHA}"
+
+      - name: Wait for deployment
+        run: |
+          aws elasticbeanstalk wait environment-updated \
+            --environment-name "$EB_ENVIRONMENT_NAME"
+
+      - name: Show deployment result
+        run: |
+          aws elasticbeanstalk describe-environments \
+            --application-name "$EB_APPLICATION_NAME" \
+            --environment-names "$EB_ENVIRONMENT_NAME" \
+            --query 'Environments[0].[Status,Health,VersionLabel]' \
+            --output table
