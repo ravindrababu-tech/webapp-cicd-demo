@@ -1,5 +1,5 @@
 
-name: Deploy to AWS Elastic Beanstalk
+name: Deploy to Elastic Beanstalk
 
 on:
   push:
@@ -16,7 +16,6 @@ env:
   EB_APPLICATION_NAME: sample-web-app
   EB_ENVIRONMENT_NAME: Sample-web-app-env
   S3_BUCKET: webapp-cicd-artifacts-909643315895
-  S3_KEY: webapp-cicd-demo/${{ github.sha }}.zip
 
 jobs:
   deploy:
@@ -27,7 +26,7 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials using OIDC
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -39,30 +38,57 @@ jobs:
       - name: Package application
         shell: bash
         run: |
-          zip -r application.zip application.py requirements.txt Procfile
-          mv application.zip deployment.zip
+          set -euo pipefail
 
-      - name: Upload deployment package to S3
+          ZIP_FILE="application-${GITHUB_SHA}.zip"
+
+          zip -r "$ZIP_FILE" \
+            application.py \
+            requirements.txt \
+            Procfile \
+            -x "*.pyc" "__pycache__/*"
+
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+          echo "S3_KEY=webapp-cicd-demo/${GITHUB_SHA}.zip" >> "$GITHUB_ENV"
+
+      - name: Upload application bundle to S3
         run: |
-          aws s3 cp deployment.zip \
+          aws s3 cp "$ZIP_FILE" \
             "s3://${S3_BUCKET}/${S3_KEY}"
 
-      - name: Create Elastic Beanstalk application version
+      - name: Create or reuse Elastic Beanstalk application version
+        shell: bash
         run: |
-          aws elasticbeanstalk create-application-version \
+          set -euo pipefail
+
+          VERSION_LABEL="gh-${GITHUB_SHA}"
+
+          EXISTING_VERSION=$(aws elasticbeanstalk describe-application-versions \
             --application-name "$EB_APPLICATION_NAME" \
-            --version-label "gh-${GITHUB_SHA}" \
-            --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
-            --process
+            --version-labels "$VERSION_LABEL" \
+            --query 'ApplicationVersions[0].VersionLabel' \
+            --output text)
+
+          if [ "$EXISTING_VERSION" = "$VERSION_LABEL" ]; then
+            echo "Version $VERSION_LABEL already exists; reusing it."
+          else
+            aws elasticbeanstalk create-application-version \
+              --application-name "$EB_APPLICATION_NAME" \
+              --version-label "$VERSION_LABEL" \
+              --source-bundle S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
+              --process
+          fi
+
+          echo "VERSION_LABEL=$VERSION_LABEL" >> "$GITHUB_ENV"
 
       - name: Deploy to Elastic Beanstalk
         run: |
           aws elasticbeanstalk update-environment \
             --application-name "$EB_APPLICATION_NAME" \
             --environment-name "$EB_ENVIRONMENT_NAME" \
-            --version-label "gh-${GITHUB_SHA}"
+            --version-label "$VERSION_LABEL"
 
-      - name: Wait for deployment
+      - name: Wait for deployment to finish
         run: |
           aws elasticbeanstalk wait environment-updated \
             --environment-name "$EB_ENVIRONMENT_NAME"
@@ -72,5 +98,5 @@ jobs:
           aws elasticbeanstalk describe-environments \
             --application-name "$EB_APPLICATION_NAME" \
             --environment-names "$EB_ENVIRONMENT_NAME" \
-            --query 'Environments[0].[Status,Health,VersionLabel]' \
+            --query 'Environments[0].{Status:Status,Health:Health,Version:VersionLabel,URL:CNAME}' \
             --output table
